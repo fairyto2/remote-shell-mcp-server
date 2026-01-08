@@ -1,0 +1,41 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "log_level": "INFO"
+  },
+  "security": {
+    "enable_auth": true,
+    "jwt_secret": "your-secret-key-here",
+    "jwt_algorithm": "HS256",
+    "jwt_expiration": 3600,
+    "api_keys": {
+      "client1": "api-key-1",
+      "client2": "api-key-2",
+      "admin": "admin-key"
+    },
+    "allowed_ips": [
+      "127.0.0.1",
+      "192.168.1.0/24"
+    ],
+    "rate_limit": 100,
+    "enable_cors": true,
+    "cors_origins": ["*"]
+  },
+  "ssh": {
+    "default_timeout": 30,
+    "max_connections": 50,
+    "keepalive_interval": 60,
+    "connection_cleanup_hours": 24
+  },
+  "sessions": {
+    "max_sessions": 100,
+    "session_cleanup_hours": 24,
+    "default_working_directory": "/home"
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    "file": "./mcp_ssh_server.log"
+  }
+}

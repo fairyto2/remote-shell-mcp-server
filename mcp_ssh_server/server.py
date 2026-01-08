@@ -638,150 +638,150 @@ class MCPSshServer:
                         text=f"获取目录列表失败: {result.get('error', '未知错误')}"
                     )
                 ],
-                ),
-                            isError=True,
-                        )
-                
-                    async def _handle_ssh_shell(self, args: Dict[str, Any]) -> CallToolResult:
-                        """处理创建交互式 shell"""
-                        connection = args["connection"]
-                        term = args.get("term", "xterm")
-                
-                        # 创建 shell
-                        result = self.ssh_manager.create_shell(connection, term)
-                
-                        if result["success"]:
-                            shell = result["shell"]
-                            
-                            # 为所有使用该连接的会话创建 shell
-                            sessions = self.session_manager.list_sessions()
-                            for session in sessions:
-                                if session["connection_name"] == connection:
-                                    self.session_manager.create_shell(session["id"], shell)
-                
-                            return CallToolResult(
-                                content=[
-                                    TextContent(
-                                        type="text",
-                                        text=f"交互式 shell 创建成功: {connection} (终端类型: {term})"
-                                    )
-                                ]
-                            )
-                        else:
-                            return CallToolResult(
-                                content=[
-                                    TextContent(
-                                        type="text",
-                                        text=f"创建交互式 shell 失败: {result.get('error', '未知错误')}"
-                                    )
-                                ],
-                                isError=True,
-                            )
-                
-                    async def _handle_shell_send(self, args: Dict[str, Any]) -> CallToolResult:
-                        """处理在 shell 中发送命令"""
-                        session_id = args["session_id"]
-                        command = args["command"]
-                
-                        # 检查会话是否存在
-                        session = self.session_manager.get_session(session_id)
-                        if not session:
-                            return CallToolResult(
-                                content=[TextContent(type="text", text=f"会话不存在: {session_id}")],
-                                isError=True,
-                            )
-                
-                        # 检查 shell 是否活跃
-                        if not self.session_manager.is_shell_active(session_id):
-                            return CallToolResult(
-                                content=[TextContent(type="text", text=f"会话 {session_id} 没有活跃的 shell")],
-                                isError=True,
-                            )
-                
-                        # 获取 shell
-                        shell = self.session_manager.get_shell(session_id)
-                        if not shell:
-                            return CallToolResult(
-                                content=[TextContent(type="text", text=f"无法获取会话 {session_id} 的 shell")],
-                                isError=True,
-                            )
-                
-                        # 发送命令
-                        result = self.ssh_manager.send_shell_command(session.connection_name, shell, command)
-                
-                        if result["success"]:
-                            # 添加用户消息
-                            self.session_manager.add_user_message(session_id, command)
-                
-                            # 添加助手消息
-                            response = f"Shell 命令执行成功:\n{result['output']}"
-                            self.session_manager.add_assistant_message(
-                                session_id, response, command, result
-                            )
-                
-                            return CallToolResult(
-                                content=[TextContent(type="text", text=response)]
-                            )
-                        else:
-                            error_msg = f"Shell 命令执行失败: {result.get('error', '未知错误')}"
-                            self.session_manager.add_assistant_message(
-                                session_id, error_msg, command, result
-                            )
-                
-                            return CallToolResult(
-                                content=[TextContent(type="text", text=error_msg)],
-                                isError=True,
-                            )
-                
-                    async def _handle_shell_close(self, args: Dict[str, Any]) -> CallToolResult:
-                        """处理关闭 shell"""
-                        session_id = args["session_id"]
-                
-                        # 检查会话是否存在
-                        session = self.session_manager.get_session(session_id)
-                        if not session:
-                            return CallToolResult(
-                                content=[TextContent(type="text", text=f"会话不存在: {session_id}")],
-                                isError=True,
-                            )
-                
-                        # 检查 shell 是否活跃
-                        if not self.session_manager.is_shell_active(session_id):
-                            return CallToolResult(
-                                content=[TextContent(type="text", text=f"会话 {session_id} 没有活跃的 shell")],
-                                isError=True,
-                            )
-                
-                        # 获取 shell
-                        shell = self.session_manager.get_shell(session_id)
-                        if not shell:
-                            return CallToolResult(
-                                content=[TextContent(type="text", text=f"无法获取会话 {session_id} 的 shell")],
-                                isError=True,
-                            )
-                
-                        # 关闭 shell
-                        result = self.ssh_manager.close_shell(session.connection_name, shell)
-                
-                        if result["success"]:
-                            # 更新会话状态
-                            self.session_manager.close_shell(session_id)
-                
-                            return CallToolResult(
-                                content=[TextContent(type="text", text=f"交互式 shell 已关闭: {session_id}")]
-                            )
-                        else:
-                            return CallToolResult(
-                                content=[
-                                    TextContent(
-                                        type="text",
-                                        text=f"关闭 shell 失败: {result.get('error', '未知错误')}"
-                                    )
-                                ],
-                                isError=True,
-                            )
-                
-                    async def run(self):        """运行服务器"""
+                isError=True,
+            )
+
+    async def _handle_ssh_shell(self, args: Dict[str, Any]) -> CallToolResult:
+        """处理创建交互式 shell"""
+        connection = args["connection"]
+        term = args.get("term", "xterm")
+
+        # 创建 shell
+        result = self.ssh_manager.create_shell(connection, term)
+
+        if result["success"]:
+            shell = result["shell"]
+            
+            # 为所有使用该连接的会话创建 shell
+            sessions = self.session_manager.list_sessions()
+            for session in sessions:
+                if session["connection_name"] == connection:
+                    self.session_manager.create_shell(session["id"], shell)
+
+            return CallToolResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text=f"交互式 shell 创建成功: {connection} (终端类型: {term})"
+                    )
+                ]
+            )
+        else:
+            return CallToolResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text=f"创建交互式 shell 失败: {result.get('error', '未知错误')}"
+                    )
+                ],
+                isError=True,
+            )
+
+    async def _handle_shell_send(self, args: Dict[str, Any]) -> CallToolResult:
+        """处理在 shell 中发送命令"""
+        session_id = args["session_id"]
+        command = args["command"]
+
+        # 检查会话是否存在
+        session = self.session_manager.get_session(session_id)
+        if not session:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"会话不存在: {session_id}")],
+                isError=True,
+            )
+
+        # 检查 shell 是否活跃
+        if not self.session_manager.is_shell_active(session_id):
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"会话 {session_id} 没有活跃的 shell")],
+                isError=True,
+            )
+
+        # 获取 shell
+        shell = self.session_manager.get_shell(session_id)
+        if not shell:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"无法获取会话 {session_id} 的 shell")],
+                isError=True,
+            )
+
+        # 发送命令
+        result = self.ssh_manager.send_shell_command(session.connection_name, shell, command)
+
+        if result["success"]:
+            # 添加用户消息
+            self.session_manager.add_user_message(session_id, command)
+
+            # 添加助手消息
+            response = f"Shell 命令执行成功:\n{result['output']}"
+            self.session_manager.add_assistant_message(
+                session_id, response, command, result
+            )
+
+            return CallToolResult(
+                content=[TextContent(type="text", text=response)]
+            )
+        else:
+            error_msg = f"Shell 命令执行失败: {result.get('error', '未知错误')}"
+            self.session_manager.add_assistant_message(
+                session_id, error_msg, command, result
+            )
+
+            return CallToolResult(
+                content=[TextContent(type="text", text=error_msg)],
+                isError=True,
+            )
+
+    async def _handle_shell_close(self, args: Dict[str, Any]) -> CallToolResult:
+        """处理关闭 shell"""
+        session_id = args["session_id"]
+
+        # 检查会话是否存在
+        session = self.session_manager.get_session(session_id)
+        if not session:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"会话不存在: {session_id}")],
+                isError=True,
+            )
+
+        # 检查 shell 是否活跃
+        if not self.session_manager.is_shell_active(session_id):
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"会话 {session_id} 没有活跃的 shell")],
+                isError=True,
+            )
+
+        # 获取 shell
+        shell = self.session_manager.get_shell(session_id)
+        if not shell:
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"无法获取会话 {session_id} 的 shell")],
+                isError=True,
+            )
+
+        # 关闭 shell
+        result = self.ssh_manager.close_shell(session.connection_name, shell)
+
+        if result["success"]:
+            # 更新会话状态
+            self.session_manager.close_shell(session_id)
+
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"交互式 shell 已关闭: {session_id}")]
+            )
+        else:
+            return CallToolResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text=f"关闭 shell 失败: {result.get('error', '未知错误')}"
+                    )
+                ],
+                isError=True,
+            )
+
+    async def run(self):
+        """运行服务器"""
         async with stdio_server() as (read_stream, write_stream):
             await self.server.run(
                 read_stream,

@@ -32,6 +32,28 @@ uv install
 uv pip install -e .
 ```
 
+### 运行模式
+
+本项目支持两种运行模式：
+
+#### 1. 本地 MCP 服务器（标准模式）
+
+```bash
+uv run mcp_ssh_server
+```
+
+适用于与本地 AI 助手（如 Claude Desktop）集成。
+
+#### 2. 远程 MCP 服务器
+
+```bash
+uv run python remote_main.py
+```
+
+适用于通过网络提供 MCP 服务，支持多客户端连接。
+
+详细配置请参考 [远程服务器文档](docs/remote_server.md)。
+
 ### 基本使用
 
 1. **启动服务器**
