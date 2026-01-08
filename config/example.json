@@ -1,0 +1,30 @@
+{
+  "log_level": "INFO",
+  "default_timeout": 30,
+  "max_sessions": 100,
+  "session_cleanup_hours": 24,
+  "keepalive_interval": 60,
+  "connections": {
+    "prod-server": {
+      "host": "prod.example.com",
+      "username": "deploy",
+      "port": 22,
+      "timeout": 30,
+      "key_filename": "/path/to/private/key"
+    },
+    "dev-server": {
+      "host": "dev.example.com",
+      "username": "developer",
+      "port": 22,
+      "timeout": 30,
+      "password": "dev_password"
+    },
+    "test-server": {
+      "host": "192.168.1.100",
+      "username": "testuser",
+      "port": 2222,
+      "timeout": 15,
+      "password": "test_password"
+    }
+  }
+}
