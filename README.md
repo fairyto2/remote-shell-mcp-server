@@ -22,7 +22,7 @@
 
 ```bash
 # 克隆项目
-git clone https://github.com/your-username/remote-shell-mcp-server.git
+git clone https://github.com/fairyto2/remote-shell-mcp-server.git
 cd remote-shell-mcp-server
 
 # 安装依赖
@@ -273,6 +273,6 @@ MCP_SSH_LOG_LEVEL=DEBUG uv run mcp_ssh_server
 
 ## 联系方式
 
-- 项目主页: https://github.com/your-username/remote-shell-mcp-server
-- 问题反馈: https://github.com/your-username/remote-shell-mcp-server/issues
-- 文档: https://github.com/your-username/remote-shell-mcp-server/docs
+- 项目主页: https://github.com/fairyto2/remote-shell-mcp-server
+- 问题反馈: https://github.com/fairyto2/remote-shell-mcp-server/issues
+- 文档: https://github.com/fairyto2/remote-shell-mcp-server/docs

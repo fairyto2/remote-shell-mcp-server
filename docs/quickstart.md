@@ -6,7 +6,7 @@
 
 ```bash
 # 克隆项目
-git clone https://github.com/your-username/remote-shell-mcp-server.git
+git clone https://github.com/fairyto2/remote-shell-mcp-server.git
 cd remote-shell-mcp-server
 
 # 安装依赖
@@ -178,3 +178,4 @@ uv run mcp_ssh_server
 - 阅读完整 [使用指南](usage.md)
 - 查看 [配置示例](../config/example.json)
 - 了解 [安全最佳实践](usage.md#安全注意事项)
+- 访问项目主页: https://github.com/fairyto2/remote-shell-mcp-server

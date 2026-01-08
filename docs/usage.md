@@ -15,7 +15,7 @@ MCP SSH 服务器是一个基于 Model Context Protocol (MCP) 的服务，提供
 
 1. 克隆项目
 ```bash
-git clone https://github.com/your-username/remote-shell-mcp-server.git
+git clone https://github.com/fairyto2/remote-shell-mcp-server.git
 cd remote-shell-mcp-server
 ```
 
