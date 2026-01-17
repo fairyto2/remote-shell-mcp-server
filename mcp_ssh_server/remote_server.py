@@ -17,6 +17,7 @@ from mcp.server.models import InitializationOptions
 from mcp.types import (
     CallToolRequest,
     CallToolResult,
+    CallToolRequestParams,
     ListToolsRequest,
     Tool,
     TextContent,
@@ -360,6 +361,8 @@ class RemoteMCPSshServer:
                 ),
             ]
             return tools
+        
+        self.list_tools_handler = list_tools
 
         @self.server.call_tool()
         async def call_tool(request: CallToolRequest) -> CallToolResult:
@@ -408,6 +411,8 @@ class RemoteMCPSshServer:
                     content=[TextContent(type="text", text=f"工具调用失败: {str(e)}")],
                     isError=True,
                 )
+        
+        self.call_tool_handler = call_tool
 
     async def websocket_handler(self, request):
         """WebSocket 处理器"""
@@ -512,7 +517,7 @@ class RemoteMCPSshServer:
                 }
             }
         elif method == "tools/list":
-            tools = await self.server.list_tools()
+            tools = await self.list_tools_handler()
             return {
                 "id": request_id,
                 "result": {
@@ -528,12 +533,12 @@ class RemoteMCPSshServer:
             }
         elif method == "tools/call":
             request = CallToolRequest(
-                params=type('Params', (), {
-                    'name': params.get('name'),
-                    'arguments': params.get('arguments', {})
-                })()
+                params={
+                    "name": params.get('name'),
+                    "arguments": params.get('arguments', {})
+                }
             )
-            result = await self.server.call_tool(request)
+            result = await self.call_tool_handler(request)
             return {
                 "id": request_id,
                 "result": {
