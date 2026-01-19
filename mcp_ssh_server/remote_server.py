@@ -459,12 +459,66 @@ class RemoteMCPSshServer:
         """HTTP 处理器"""
         try:
             data = await request.json()
+            
+            # 验证必需的字段
+            if "jsonrpc" not in data:
+                return web.json_response({
+                    "error": {
+                        "code": -32600,
+                        "message": "Invalid Request",
+                        "data": "Missing 'jsonrpc' field"
+                    }
+                }, status=400)
+            
+            if data["jsonrpc"] != "2.0":
+                return web.json_response({
+                    "error": {
+                        "code": -32600,
+                        "message": "Invalid Request",
+                        "data": "jsonrpc field must be '2.0'"
+                    }
+                }, status=400)
+            
+            # 对于请求（而不是通知），需要有 method 和 id 字段
+            if "method" not in data:
+                # 检查是否是响应（有 result 或 error 字段）
+                if "result" in data or "error" in data:
+                    logger.warning(f"Received response instead of request: {data}")
+                    return web.json_response({
+                        "error": {
+                            "code": -32600,
+                            "message": "Invalid Request",
+                            "data": "Expected request with 'method', got response with 'result' or 'error'"
+                        }
+                    }, status=400)
+                else:
+                    return web.json_response({
+                        "error": {
+                            "code": -32600,
+                            "message": "Invalid Request",
+                            "data": "Missing 'method' field"
+                        }
+                    }, status=400)
+            
             response = await self._process_mcp_request(data)
             return web.json_response(response)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON 解析错误: {e}")
+            return web.json_response({
+                "error": {
+                    "code": -32700,
+                    "message": "Parse error",
+                    "data": "Invalid JSON"
+                }
+            }, status=400)
         except Exception as e:
             logger.error(f"HTTP 处理错误: {e}")
             return web.json_response({
-                "error": str(e)
+                "error": {
+                    "code": -32603,
+                    "message": "Internal error",
+                    "data": str(e)
+                }
             }, status=500)
 
     async def health_handler(self, request):
@@ -536,26 +590,73 @@ class RemoteMCPSshServer:
                 }
             }
         elif method == "tools/call":
-            request = CallToolRequest(
-                params={
-                    "name": params.get('name'),
-                    "arguments": params.get('arguments', {})
+            # 直接处理工具调用，绕过CallToolRequest的创建
+            try:
+                tool_name = params.get('name', '')
+                tool_args = params.get('arguments', {})
+                
+                # 根据工具名称直接调用相应的处理函数
+                if tool_name == "ssh_connect":
+                    result = await self._handle_ssh_connect(tool_args)
+                elif tool_name == "ssh_disconnect":
+                    result = await self._handle_ssh_disconnect(tool_args)
+                elif tool_name == "ssh_list_connections":
+                    result = await self._handle_ssh_list_connections(tool_args)
+                elif tool_name == "ssh_execute":
+                    result = await self._handle_ssh_execute(tool_args)
+                elif tool_name == "ssh_upload":
+                    result = await self._handle_ssh_upload(tool_args)
+                elif tool_name == "ssh_download":
+                    result = await self._handle_ssh_download(tool_args)
+                elif tool_name == "ssh_list":
+                    result = await self._handle_ssh_list(tool_args)
+                elif tool_name == "session_create":
+                    result = await self._handle_session_create(tool_args)
+                elif tool_name == "session_list":
+                    result = await self._handle_session_list(tool_args)
+                elif tool_name == "session_delete":
+                    result = await self._handle_session_delete(tool_args)
+                elif tool_name == "session_execute":
+                    result = await self._handle_session_execute(tool_args)
+                elif tool_name == "session_history":
+                    result = await self._handle_session_history(tool_args)
+                elif tool_name == "session_context":
+                    result = await self._handle_session_context(tool_args)
+                elif tool_name == "ssh_shell":
+                    result = await self._handle_ssh_shell(tool_args)
+                elif tool_name == "shell_send":
+                    result = await self._handle_shell_send(tool_args)
+                elif tool_name == "shell_close":
+                    result = await self._handle_shell_close(tool_args)
+                else:
+                    result = CallToolResult(
+                        content=[TextContent(type="text", text=f"未知工具: {tool_name}")],
+                        isError=True,
+                    )
+                
+                return {
+                    "id": request_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": getattr(content, 'type', 'text'),
+                                "text": getattr(content, 'text', str(content))
+                            }
+                            for content in result.content
+                        ],
+                        "isError": result.isError
+                    }
                 }
-            )
-            result = await self.call_tool_handler(request)
-            return {
-                "id": request_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": content.type,
-                            "text": content.text
-                        }
-                        for content in result.content
-                    ],
-                    "isError": result.isError
+            except Exception as e:
+                logger.error(f"处理工具调用失败: {e}")
+                logger.exception(e)  # 输出完整的堆栈跟踪
+                return {
+                    "id": request_id,
+                    "error": {
+                        "code": -32603,
+                        "message": f"工具调用失败: {str(e)}"
+                    }
                 }
-            }
         else:
             return {
                 "id": request_id,
@@ -908,5 +1009,19 @@ class RemoteMCPSshServer:
                 "status": "/status"
             }
         })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
