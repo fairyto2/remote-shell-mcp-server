@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.backends import default_backend
 import secrets
+from ipaddress import ip_network, ip_address, IPv4Address, IPv6Address, IPv4Network, IPv6Network
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ class AuthConfig:
     jwt_algorithm: str = "HS256"
     jwt_expiration: int = 3600  # 1小时
     api_keys: Dict[str, str] = field(default_factory=dict)  # client_id: api_key
-    allowed_ips: List[str] = field(default_factory=list)  # 允许的 IP 地址
+    allowed_ips: List[str] = field(default_factory=list)  # 允许的 IP 地址或网段
     rate_limit: int = 100  # 每分钟请求限制
     enable_cors: bool = True
     cors_origins: List[str] = field(default_factory=lambda: ["*"])
@@ -156,10 +157,38 @@ class AuthManager:
         return self.rate_limiter.is_allowed(client_id)
     
     def is_ip_allowed(self, ip: str) -> bool:
-        """检查 IP 是否允许"""
+        """检查 IP 是否允许，支持单个 IP 和 IP 网段"""
         if not self.config.allowed_ips:
             return True
-        return ip in self.config.allowed_ips
+        
+        try:
+            # 尝试解析传入的 IP 地址
+            client_ip = ip_address(ip)
+        except ValueError:
+            # 如果不是有效的 IP 地址，直接返回 False
+            logger.warning(f"无效的 IP 地址格式: {ip}")
+            return False
+        
+        # 遍历允许的 IP 列表，检查是否匹配
+        for allowed_ip in self.config.allowed_ips:
+            try:
+                # 尝试将其作为网络地址解析
+                network = ip_network(allowed_ip, strict=False)
+                
+                # 如果 IP 在该网络范围内，则允许
+                if client_ip in network:
+                    return True
+            except ValueError:
+                # 如果不是有效的网络地址，尝试作为单个 IP 地址比较
+                try:
+                    allowed_addr = ip_address(allowed_ip)
+                    if client_ip == allowed_addr:
+                        return True
+                except ValueError:
+                    # 如果仍然不是有效地址，跳过此项
+                    continue
+        
+        return False
 
 
 class SecurityMiddleware:

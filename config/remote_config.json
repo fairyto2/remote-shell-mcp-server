@@ -5,7 +5,7 @@
     "log_level": "INFO"
   },
   "security": {
-    "enable_auth": true,
+    "enable_auth": false,
     "jwt_secret": "your-secret-key-here",
     "jwt_algorithm": "HS256",
     "jwt_expiration": 3600,
@@ -16,7 +16,8 @@
     },
     "allowed_ips": [
       "127.0.0.1",
-      "192.168.1.0/24"
+      "192.168.1.0/24",
+      "10.0.0.0/8"
     ],
     "rate_limit": 100,
     "enable_cors": true,

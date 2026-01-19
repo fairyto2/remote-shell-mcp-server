@@ -200,6 +200,10 @@ class RemoteMCPSshServer:
     
     def _setup_routes(self):
         """设置路由"""
+        # 添加根路径处理器
+        self.app.router.add_get('/', self.root_handler)
+        self.app.router.add_post('/', self.root_handler)
+        
         self.app.router.add_get('/ws', self.websocket_handler)
         self.app.router.add_post('/mcp', self.http_handler)
         self.app.router.add_get('/health', self.health_handler)
@@ -890,3 +894,19 @@ class RemoteMCPSshServer:
         """停止服务器"""
         self.ssh_manager.shutdown()
         logger.info("远程 MCP SSH 服务器已停止")
+
+    async def root_handler(self, request):
+        """根路径处理器 - 返回服务器信息"""
+        return web.json_response({
+            "server": "mcp-ssh-server",
+            "version": "0.1.0",
+            "message": "欢迎使用 MCP SSH 服务器，请使用 /mcp 路径进行 MCP 通信，或使用 /ws 进行 WebSocket 通信",
+            "endpoints": {
+                "mcp": "/mcp",
+                "websocket": "/ws",
+                "health": "/health", 
+                "status": "/status"
+            }
+        })
+
+
