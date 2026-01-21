@@ -1,4 +1,4 @@
-WebSocket 客户端示例
+"""WebSocket 客户端示例
 
 展示如何通过 WebSocket 连接到远程 MCP SSH 服务器。
 """
@@ -31,7 +31,11 @@ class WebSocketMCPClient:
             "X-Client-ID": self.client_id
         }
         
-        self.websocket = await websockets.connect(self.url, extra_headers=headers)
+        self.websocket = await websockets.connect(
+            self.url,
+            extra_headers=headers,
+            subprotocols=["mcp"],
+        )
         logger.info(f"已连接到 WebSocket 服务器: {self.url}")
         
         # 初始化连接

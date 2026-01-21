@@ -1,1027 +1,565 @@
-"""
-远程 MCP 服务器实现
+"""远程 MCP SSH 服务器（FastMCP 版本）
 
-通过 HTTP/WebSocket 提供 MCP 服务，支持远程客户端连接。
+通过 Streamable HTTP 在 `/mcp` 提供 MCP 服务，并提供 `/ws` WebSocket 传输。
 """
 
-import asyncio
-import json
+from __future__ import annotations
+
 import logging
 import os
-import uuid
-from typing import Dict, Any, Optional, List
-import aiohttp
-from aiohttp import web, WSMsgType
-from mcp.server import Server
-from mcp.server.models import InitializationOptions
-from mcp.types import (
-    CallToolRequest,
-    CallToolResult,
-    CallToolRequestParams,
-    ListToolsRequest,
-    Tool,
-    TextContent,
-)
+import secrets
+import time
+import json
+from typing import Any, Dict, Optional
 
-from .ssh_manager import SSHConnectionManager, SSHConfig
+import uvicorn
+from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.websocket import websocket_server
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import WebSocketRoute
+
+from .security import AuthConfig, AuthManager
 from .session_manager import SessionManager
-from .config import ConfigManager
-from .security import SecurityMiddleware, AuthManager, create_default_config
+from .ssh_manager import SSHConfig, SSHConnectionManager
 
+# 配置日志
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+# --- 辅助函数 ---
 
-class RemoteMCPSshServer:
-    """远程 MCP SSH 服务器"""
+def _get_client_ip(scope) -> str:
+    client = scope.get("client")
+    if isinstance(client, (list, tuple)) and client:
+        return str(client[0])
+    return "0.0.0.0"
 
-    def __init__(self, config_path: Optional[str] = None):
-        # 加载配置
-        self.config = self._load_config(config_path)
-        
-        self.host = self.config["server"]["host"]
-        self.port = self.config["server"]["port"]
-        self.app = web.Application()
-        self.server = Server("mcp-ssh-server")
-        self.ssh_manager = SSHConnectionManager()
-        self.session_manager = SessionManager()
-        
-        # 安全配置
-        auth_config = self._create_auth_config()
-        self.auth_manager = AuthManager(auth_config)
-        self.security = SecurityMiddleware(self.auth_manager)
-        
-        # 客户端连接管理
-        self.clients: Dict[str, web.WebSocketResponse] = {}
-        self.client_sessions: Dict[str, Dict[str, Any]] = {}
-        
-        self._setup_routes()
-        self._setup_handlers()
-        self._setup_middleware()
-        
-        # 设置日志
-        self._setup_logging()
+def _get_header(scope, name: str) -> Optional[str]:
+    raw = scope.get("headers") or []
+    key = name.lower().encode()
+    for k, v in raw:
+        if k.lower() == key:
+            try:
+                return v.decode()
+            except Exception:
+                return None
+    return None
 
-    def _setup_middleware(self):
-        """设置中间件"""
-        @web.middleware
-        async def auth_middleware(request, handler):
-            # 认证请求
-            client_id = await self.security.authenticate_request(request)
-            if not client_id:
-                return web.json_response(
-                    {"error": "认证失败"},
-                    status=401
+def _cors_headers(cors_origins: list[str], origin: str) -> list[tuple[bytes, bytes]]:
+    allow_origin = "*"
+    if "*" not in cors_origins:
+        if origin in cors_origins:
+            allow_origin = origin
+        else:
+            allow_origin = cors_origins[0] if cors_origins else "*"
+
+    return [
+        (b"access-control-allow-origin", allow_origin.encode()),
+        (b"access-control-allow-methods", b"GET, POST, PUT, DELETE, OPTIONS"),
+        (
+            b"access-control-allow-headers",
+            b"Content-Type, Authorization, X-API-Key, X-Client-ID",
+        ),
+        (b"access-control-max-age", b"86400"),
+    ]
+
+# --- 中间件 ---
+
+class ApiKeyAuthMiddleware:
+    def __init__(
+        self,
+        app,
+        *,
+        auth_manager: AuthManager,
+        enable_cors: bool,
+        cors_origins: list[str],
+        public_paths: set[str],
+    ):
+        self.app = app
+        self.auth_manager = auth_manager
+        self.enable_cors = enable_cors
+        self.cors_origins = cors_origins
+        self.public_paths = public_paths
+
+    async def __call__(self, scope, receive, send):
+        scope_type = scope.get("type")
+        if scope_type == "http":
+            path = scope.get("path", "")
+            method = scope.get("method", "")
+            if self.enable_cors and method == "OPTIONS":
+                origin = _get_header(scope, "origin") or "*"
+                headers = _cors_headers(self.cors_origins, origin)
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 204,
+                        "headers": headers,
+                    }
                 )
-            
-            # 将客户端 ID 添加到请求中
-            request["client_id"] = client_id
-            
-            try:
-                response = await handler(request)
-                # 添加 CORS 头
-                self.security.add_cors_headers(response)
-                return response
-            except Exception as e:
-                logger.error(f"处理请求失败: {e}")
-                return web.json_response(
-                    {"error": "内部服务器错误"},
-                    status=500
-                )
-        
-        self.app.middlewares.append(auth_middleware)
+                await send({"type": "http.response.body", "body": b""})
+                return
 
-    def _load_config(self, config_path: Optional[str] = None) -> Dict[str, Any]:
-        """加载配置文件"""
-        import json
-        import os
-        
-        # 默认配置
-        default_config = {
-            "server": {
-                "host": os.getenv("MCP_SSH_HOST", "0.0.0.0"),
-                "port": int(os.getenv("MCP_SSH_PORT", "8080")),
-                "log_level": os.getenv("MCP_SSH_LOG_LEVEL", "INFO")
-            },
-            "security": {
-                "enable_auth": True,
-                "jwt_secret": "",
-                "jwt_algorithm": "HS256",
-                "jwt_expiration": 3600,
-                "api_keys": {},
-                "allowed_ips": [],
-                "rate_limit": 100,
-                "enable_cors": True,
-                "cors_origins": ["*"]
-            },
-            "ssh": {
-                "default_timeout": 30,
-                "max_connections": 50,
-                "keepalive_interval": 60,
-                "connection_cleanup_hours": 24
-            },
-            "sessions": {
-                "max_sessions": 100,
-                "session_cleanup_hours": 24,
-                "default_working_directory": "/home"
-            },
-            "logging": {
-                "level": "INFO",
-                "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-                "file": None
-            }
-        }
-        
-        # 如果指定了配置文件路径，尝试加载
-        if config_path and os.path.exists(config_path):
-            try:
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    file_config = json.load(f)
-                
-                # 合并配置
-                self._deep_update(default_config, file_config)
-                logger.info(f"已加载配置文件: {config_path}")
-            except Exception as e:
-                logger.error(f"加载配置文件失败: {e}")
-        
-        return default_config
-    
-    def _deep_update(self, base_dict: dict, update_dict: dict):
-        """深度更新字典"""
-        for key, value in update_dict.items():
-            if key in base_dict and isinstance(base_dict[key], dict) and isinstance(value, dict):
-                self._deep_update(base_dict[key], value)
-            else:
-                base_dict[key] = value
-    
-    def _create_auth_config(self) -> 'AuthConfig':
-        """创建认证配置"""
-        from .security import AuthConfig
-        
-        security_config = self.config["security"]
-        
-        return AuthConfig(
-            enable_auth=security_config["enable_auth"],
-            jwt_secret=security_config["jwt_secret"] or os.getenv("MCP_SSH_JWT_SECRET", ""),
-            jwt_algorithm=security_config["jwt_algorithm"],
-            jwt_expiration=security_config["jwt_expiration"],
-            api_keys=security_config["api_keys"],
-            allowed_ips=security_config["allowed_ips"],
-            rate_limit=security_config["rate_limit"],
-            enable_cors=security_config["enable_cors"],
-            cors_origins=security_config["cors_origins"]
-        )
-    
-    def _setup_logging(self):
-        """设置日志"""
-        import logging
-        
-        log_config = self.config["logging"]
-        
-        # 设置日志级别
-        log_level = getattr(logging, log_config["level"].upper())
-        
-        # 创建处理器
-        handlers = [logging.StreamHandler()]
-        
-        # 如果指定了日志文件，添加文件处理器
-        if log_config.get("file"):
-            try:
-                file_handler = logging.FileHandler(log_config["file"])
-                handlers.append(file_handler)
-            except Exception as e:
-                logger.error(f"无法创建日志文件处理器: {e}")
-        
-        # 配置根日志器
-        logging.basicConfig(
-            level=log_level,
-            format=log_config["format"],
-            handlers=handlers
-        )
-    
-    def _setup_routes(self):
-        """设置路由"""
-        # 添加根路径处理器
-        self.app.router.add_get('/', self.root_handler)
-        self.app.router.add_post('/', self.root_handler)
-        
-        self.app.router.add_get('/ws', self.websocket_handler)
-        self.app.router.add_post('/mcp', self.http_handler)
-        self.app.router.add_get('/health', self.health_handler)
-        self.app.router.add_get('/status', self.status_handler)
-
-    def _setup_handlers(self):
-        """设置 MCP 处理器"""
-        @self.server.list_tools()
-        async def list_tools() -> List[Tool]:
-            """列出可用工具"""
-            tools = [
-                Tool(
-                    name="ssh_connect",
-                    description="建立 SSH 连接",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string", "description": "连接名称"},
-                            "host": {"type": "string", "description": "主机地址"},
-                            "port": {"type": "integer", "description": "端口号", "default": 22},
-                            "username": {"type": "string", "description": "用户名"},
-                            "password": {"type": "string", "description": "密码"},
-                            "key_filename": {"type": "string", "description": "私钥文件路径"},
-                            "timeout": {"type": "integer", "description": "连接超时时间", "default": 30},
-                        },
-                        "required": ["name", "host", "username"],
-                    },
-                ),
-                Tool(
-                    name="ssh_disconnect",
-                    description="断开 SSH 连接",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string", "description": "连接名称"}
-                        },
-                        "required": ["name"],
-                    },
-                ),
-                Tool(
-                    name="ssh_list_connections",
-                    description="列出所有 SSH 连接",
-                    inputSchema={"type": "object", "properties": {}},
-                ),
-                Tool(
-                    name="ssh_execute",
-                    description="在远程服务器上执行命令",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "connection": {"type": "string", "description": "连接名称"},
-                            "command": {"type": "string", "description": "要执行的命令"},
-                            "timeout": {"type": "integer", "description": "命令超时时间", "default": 30},
-                        },
-                        "required": ["connection", "command"],
-                    },
-                ),
-                Tool(
-                    name="ssh_upload",
-                    description="上传文件到远程服务器",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "connection": {"type": "string", "description": "连接名称"},
-                            "local_path": {"type": "string", "description": "本地文件路径"},
-                            "remote_path": {"type": "string", "description": "远程文件路径"},
-                        },
-                        "required": ["connection", "local_path", "remote_path"],
-                    },
-                ),
-                Tool(
-                    name="ssh_download",
-                    description="从远程服务器下载文件",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "connection": {"type": "string", "description": "连接名称"},
-                            "remote_path": {"type": "string", "description": "远程文件路径"},
-                            "local_path": {"type": "string", "description": "本地文件路径"},
-                        },
-                        "required": ["connection", "remote_path", "local_path"],
-                    },
-                ),
-                Tool(
-                    name="ssh_list",
-                    description="列出远程目录内容",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "connection": {"type": "string", "description": "连接名称"},
-                            "path": {"type": "string", "description": "目录路径", "default": "."},
-                        },
-                        "required": ["connection"],
-                    },
-                ),
-                Tool(
-                    name="session_create",
-                    description="创建新的交互会话",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string", "description": "会话名称"},
-                            "connection": {"type": "string", "description": "SSH 连接名称"},
-                        },
-                        "required": ["name", "connection"],
-                    },
-                ),
-                Tool(
-                    name="session_list",
-                    description="列出所有会话",
-                    inputSchema={"type": "object", "properties": {}},
-                ),
-                Tool(
-                    name="session_delete",
-                    description="删除会话",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "session_id": {"type": "string", "description": "会话 ID"}
-                        },
-                        "required": ["session_id"],
-                    },
-                ),
-                Tool(
-                    name="session_execute",
-                    description="在会话中执行命令",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "session_id": {"type": "string", "description": "会话 ID"},
-                            "command": {"type": "string", "description": "要执行的命令"},
-                            "timeout": {"type": "integer", "description": "命令超时时间", "default": 30},
-                        },
-                        "required": ["session_id", "command"],
-                    },
-                ),
-                Tool(
-                    name="session_history",
-                    description="获取会话历史记录",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "session_id": {"type": "string", "description": "会话 ID"},
-                            "count": {"type": "integer", "description": "返回消息数量", "default": 20},
-                        },
-                        "required": ["session_id"],
-                    },
-                ),
-                Tool(
-                    name="session_context",
-                    description="获取会话上下文信息",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "session_id": {"type": "string", "description": "会话 ID"}
-                        },
-                        "required": ["session_id"],
-                    },
-                ),
-            ]
-            return tools
-        
-        self.list_tools_handler = list_tools
-
-        @self.server.call_tool()
-        async def call_tool(request: CallToolRequest) -> CallToolResult:
-            """处理工具调用"""
-            try:
-                args = request.params.arguments or {}
-                if request.params.name == "ssh_connect":
-                    return await self._handle_ssh_connect(args)
-                elif request.params.name == "ssh_disconnect":
-                    return await self._handle_ssh_disconnect(args)
-                elif request.params.name == "ssh_list_connections":
-                    return await self._handle_ssh_list_connections(args)
-                elif request.params.name == "ssh_execute":
-                    return await self._handle_ssh_execute(args)
-                elif request.params.name == "ssh_upload":
-                    return await self._handle_ssh_upload(args)
-                elif request.params.name == "ssh_download":
-                    return await self._handle_ssh_download(args)
-                elif request.params.name == "ssh_list":
-                    return await self._handle_ssh_list(args)
-                elif request.params.name == "session_create":
-                    return await self._handle_session_create(args)
-                elif request.params.name == "session_list":
-                    return await self._handle_session_list(args)
-                elif request.params.name == "session_delete":
-                    return await self._handle_session_delete(args)
-                elif request.params.name == "session_execute":
-                    return await self._handle_session_execute(args)
-                elif request.params.name == "session_history":
-                    return await self._handle_session_history(args)
-                elif request.params.name == "session_context":
-                    return await self._handle_session_context(args)
-                else:
-                    return CallToolResult(
-                        content=[
-                            TextContent(
-                                type="text", text=f"未知工具: {request.params.name}"
-                            )
-                        ],
-                        isError=True,
+            if path not in self.public_paths:
+                client_ip = _get_client_ip(scope)
+                client_id = self._authenticate(scope, client_ip)
+                if not client_id:
+                    origin = _get_header(scope, "origin") or "*"
+                    headers = [(b"content-type", b"application/json")] + _cors_headers(
+                        self.cors_origins, origin
                     )
-
-            except Exception as e:
-                logger.error(f"工具调用失败: {e}")
-                return CallToolResult(
-                    content=[TextContent(type="text", text=f"工具调用失败: {str(e)}")],
-                    isError=True,
-                )
-        
-        self.call_tool_handler = call_tool
-
-    async def websocket_handler(self, request):
-        """WebSocket 处理器"""
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-        
-        client_id = str(uuid.uuid4())
-        self.clients[client_id] = ws
-        self.client_sessions[client_id] = {
-            "initialized": False,
-            "capabilities": None
-        }
-        
-        logger.info(f"客户端连接: {client_id}")
-        
-        try:
-            async for msg in ws:
-                if msg.type == WSMsgType.TEXT:
-                    try:
-                        data = json.loads(msg.data)
-                        await self._handle_websocket_message(client_id, data)
-                    except json.JSONDecodeError:
-                        await ws.send_str(json.dumps({
-                            "error": "无效的 JSON 格式"
-                        }))
-                elif msg.type == WSMsgType.ERROR:
-                    logger.error(f"WebSocket 错误: {ws.exception()}")
-        except Exception as e:
-            logger.error(f"WebSocket 处理错误: {e}")
-        finally:
-            if client_id in self.clients:
-                del self.clients[client_id]
-            if client_id in self.client_sessions:
-                del self.client_sessions[client_id]
-            logger.info(f"客户端断开: {client_id}")
-        
-        return ws
-
-    async def http_handler(self, request):
-        """HTTP 处理器"""
-        try:
-            data = await request.json()
-            
-            # 验证必需的字段
-            if "jsonrpc" not in data:
-                return web.json_response({
-                    "error": {
-                        "code": -32600,
-                        "message": "Invalid Request",
-                        "data": "Missing 'jsonrpc' field"
-                    }
-                }, status=400)
-            
-            if data["jsonrpc"] != "2.0":
-                return web.json_response({
-                    "error": {
-                        "code": -32600,
-                        "message": "Invalid Request",
-                        "data": "jsonrpc field must be '2.0'"
-                    }
-                }, status=400)
-            
-            # 对于请求（而不是通知），需要有 method 和 id 字段
-            if "method" not in data:
-                # 检查是否是响应（有 result 或 error 字段）
-                if "result" in data or "error" in data:
-                    logger.warning(f"Received response instead of request: {data}")
-                    return web.json_response({
-                        "error": {
-                            "code": -32600,
-                            "message": "Invalid Request",
-                            "data": "Expected request with 'method', got response with 'result' or 'error'"
-                        }
-                    }, status=400)
-                else:
-                    return web.json_response({
-                        "error": {
-                            "code": -32600,
-                            "message": "Invalid Request",
-                            "data": "Missing 'method' field"
-                        }
-                    }, status=400)
-            
-            response = await self._process_mcp_request(data)
-            return web.json_response(response)
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON 解析错误: {e}")
-            return web.json_response({
-                "error": {
-                    "code": -32700,
-                    "message": "Parse error",
-                    "data": "Invalid JSON"
-                }
-            }, status=400)
-        except Exception as e:
-            logger.error(f"HTTP 处理错误: {e}")
-            return web.json_response({
-                "error": {
-                    "code": -32603,
-                    "message": "Internal error",
-                    "data": str(e)
-                }
-            }, status=500)
-
-    async def health_handler(self, request):
-        """健康检查处理器"""
-        return web.json_response({
-            "status": "healthy",
-            "timestamp": asyncio.get_event_loop().time()
-        })
-
-    async def status_handler(self, request):
-        """状态检查处理器"""
-        return web.json_response({
-            "server": "mcp-ssh-server",
-            "version": "0.1.0",
-            "clients": len(self.clients),
-            "ssh_connections": len(self.ssh_manager.list_connections()),
-            "sessions": len(self.session_manager.list_sessions())
-        })
-
-    async def _handle_websocket_message(self, client_id: str, data: Dict[str, Any]):
-        """处理 WebSocket 消息"""
-        ws = self.clients.get(client_id)
-        if not ws:
-            return
-        
-        try:
-            response = await self._process_mcp_request(data)
-            await ws.send_str(json.dumps(response))
-        except Exception as e:
-            logger.error(f"处理 WebSocket 消息失败: {e}")
-            await ws.send_str(json.dumps({
-                "error": str(e)
-            }))
-
-    async def _process_mcp_request(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """处理 MCP 请求"""
-        method = data.get("method")
-        params = data.get("params", {})
-        request_id = data.get("id")
-        
-        if method == "initialize":
-            return {
-                "id": request_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {
-                        "tools": {},
-                        "logging": {}
-                    },
-                    "serverInfo": {
-                        "name": "mcp-ssh-server",
-                        "version": "0.1.0"
-                    }
-                }
-            }
-        elif method == "tools/list":
-            tools = await self.list_tools_handler()
-            return {
-                "id": request_id,
-                "result": {
-                    "tools": [
+                    await send(
                         {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "inputSchema": tool.inputSchema
+                            "type": "http.response.start",
+                            "status": 401,
+                            "headers": headers,
                         }
-                        for tool in tools
-                    ]
-                }
-            }
-        elif method == "tools/call":
-            # 直接处理工具调用，绕过CallToolRequest的创建
-            try:
-                tool_name = params.get('name', '')
-                tool_args = params.get('arguments', {})
-                
-                # 根据工具名称直接调用相应的处理函数
-                if tool_name == "ssh_connect":
-                    result = await self._handle_ssh_connect(tool_args)
-                elif tool_name == "ssh_disconnect":
-                    result = await self._handle_ssh_disconnect(tool_args)
-                elif tool_name == "ssh_list_connections":
-                    result = await self._handle_ssh_list_connections(tool_args)
-                elif tool_name == "ssh_execute":
-                    result = await self._handle_ssh_execute(tool_args)
-                elif tool_name == "ssh_upload":
-                    result = await self._handle_ssh_upload(tool_args)
-                elif tool_name == "ssh_download":
-                    result = await self._handle_ssh_download(tool_args)
-                elif tool_name == "ssh_list":
-                    result = await self._handle_ssh_list(tool_args)
-                elif tool_name == "session_create":
-                    result = await self._handle_session_create(tool_args)
-                elif tool_name == "session_list":
-                    result = await self._handle_session_list(tool_args)
-                elif tool_name == "session_delete":
-                    result = await self._handle_session_delete(tool_args)
-                elif tool_name == "session_execute":
-                    result = await self._handle_session_execute(tool_args)
-                elif tool_name == "session_history":
-                    result = await self._handle_session_history(tool_args)
-                elif tool_name == "session_context":
-                    result = await self._handle_session_context(tool_args)
-                elif tool_name == "ssh_shell":
-                    result = await self._handle_ssh_shell(tool_args)
-                elif tool_name == "shell_send":
-                    result = await self._handle_shell_send(tool_args)
-                elif tool_name == "shell_close":
-                    result = await self._handle_shell_close(tool_args)
-                else:
-                    result = CallToolResult(
-                        content=[TextContent(type="text", text=f"未知工具: {tool_name}")],
-                        isError=True,
                     )
-                
-                return {
-                    "id": request_id,
-                    "result": {
-                        "content": [
-                            {
-                                "type": getattr(content, 'type', 'text'),
-                                "text": getattr(content, 'text', str(content))
-                            }
-                            for content in result.content
-                        ],
-                        "isError": result.isError
-                    }
-                }
-            except Exception as e:
-                logger.error(f"处理工具调用失败: {e}")
-                logger.exception(e)  # 输出完整的堆栈跟踪
-                return {
-                    "id": request_id,
-                    "error": {
-                        "code": -32603,
-                        "message": f"工具调用失败: {str(e)}"
-                    }
-                }
-        else:
-            return {
-                "id": request_id,
-                "error": {
-                    "code": -32601,
-                    "message": f"未知方法: {method}"
-                }
-            }
-
-    # 工具处理方法（与原 server.py 相同）
-    async def _handle_ssh_connect(self, args: Dict[str, Any]) -> CallToolResult:
-        """处理 SSH 连接"""
-        name = args["name"]
-        host = args["host"]
-        username = args["username"]
-        port = args.get("port", 22)
-        password = args.get("password")
-        key_filename = args.get("key_filename")
-        timeout = args.get("timeout", 30)
-
-        config = SSHConfig(
-            host=host,
-            username=username,
-            port=port,
-            password=password,
-            key_filename=key_filename,
-            timeout=timeout,
-        )
-
-        success = self.ssh_manager.add_connection(name, config)
-
-        if success:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"SSH 连接建立成功: {name}")]
-            )
-        else:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"SSH 连接失败: {name}")],
-                isError=True,
-            )
-
-    async def _handle_ssh_disconnect(self, args: Dict[str, Any]) -> CallToolResult:
-        """处理 SSH 断开连接"""
-        name = args["name"]
-        self.ssh_manager.remove_connection(name)
-
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"SSH 连接已断开: {name}")]
-        )
-
-    async def _handle_ssh_list_connections(self, args: Dict[str, Any]) -> CallToolResult:
-        """处理列出 SSH 连接"""
-        connections = self.ssh_manager.list_connections()
-
-        if not connections:
-            return CallToolResult(
-                content=[TextContent(type="text", text="没有活跃的 SSH 连接")]
-            )
-
-        result = "SSH 连接列表:\n"
-        for name, info in connections.items():
-            status = "已连接" if info["is_connected"] else "未连接"
-            result += f"- {name}: {info['username']}@{info['host']} ({status})\n"
-
-        return CallToolResult(content=[TextContent(type="text", text=result)])
-
-    async def _handle_ssh_execute(self, args: Dict[str, Any]) -> CallToolResult:
-        """处理 SSH 命令执行"""
-        connection = args["connection"]
-        command = args["command"]
-        timeout = args.get("timeout", 30)
-
-        result = self.ssh_manager.execute_command(connection, command, timeout)
-
-        if result["success"]:
-            output = f"命令执行成功:\n{result['stdout']}"
-            if result["stderr"]:
-                output += f"\n标准错误:\n{result['stderr']}"
-        else:
-            output = f"命令执行失败: {result.get('error', '未知错误')}"
-
-        return CallToolResult(
-            content=[TextContent(type="text", text=output)],
-            isError=not result["success"],
-        )
-
-    async def _handle_ssh_upload(self, args: Dict[str, Any]) -> CallToolResult:
-        """处理文件上传"""
-        connection = args["connection"]
-        local_path = args["local_path"]
-        remote_path = args["remote_path"]
-
-        result = self.ssh_manager.upload_file(connection, local_path, remote_path)
-
-        if result["success"]:
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=f"文件上传成功: {local_path} -> {remote_path}"
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": b'{"error":"\xe8\xae\xa4\xe8\af\x81\xe5\xa4\xb1\xe8\xb4\xa5"}',
+                        }
                     )
-                ]
-            )
-        else:
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=f"文件上传失败: {result.get('error', '未知错误')}"
-                    )
-                ],
-                isError=True,
-            )
+                    return
+                scope.setdefault("state", {})["client_id"] = client_id
 
-    async def _handle_ssh_download(self, args: Dict[str, Any]) -> CallToolResult:
-        """处理文件下载"""
-        connection = args["connection"]
-        remote_path = args["remote_path"]
-        local_path = args["local_path"]
+            if not self.enable_cors:
+                await self.app(scope, receive, send)
+                return
 
-        result = self.ssh_manager.download_file(connection, remote_path, local_path)
+            origin = _get_header(scope, "origin") or "*"
+            cors_headers = _cors_headers(self.cors_origins, origin)
 
-        if result["success"]:
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=f"文件下载成功: {remote_path} -> {local_path}"
-                    )
-                ]
-            )
-        else:
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=f"文件下载失败: {result.get('error', '未知错误')}"
-                    )
-                ],
-                isError=True,
-            )
+            async def send_with_cors(message):
+                if message.get("type") == "http.response.start":
+                    raw_headers = list(message.get("headers", []))
+                    raw_headers.extend(cors_headers)
+                    message["headers"] = raw_headers
+                await send(message)
 
-    async def _handle_ssh_list(self, args: Dict[str, Any]) -> CallToolResult:
-        """处理目录列表"""
-        connection = args["connection"]
-        path = args.get("path", ".")
+            await self.app(scope, receive, send_with_cors)
+            return
 
-        result = self.ssh_manager.list_directory(connection, path)
+        if scope_type == "websocket":
+            path = scope.get("path", "")
+            if path not in self.public_paths:
+                client_ip = _get_client_ip(scope)
+                client_id = self._authenticate(scope, client_ip)
+                if not client_id:
+                    await send({"type": "websocket.close", "code": 1008})
+                    return
+                scope.setdefault("state", {})["client_id"] = client_id
 
-        if result["success"]:
-            files = result["files"]
-            if not files:
-                return CallToolResult(
-                    content=[TextContent(type="text", text=f"目录为空: {path}")]
-                )
+        await self.app(scope, receive, send)
 
-            output = f"目录内容: {path}\n"
-            for file_info in files:
-                file_type = "目录" if file_info["type"] == "directory" else "文件"
-                output += f"{file_type}: {file_info['name']}"
-                if file_info["size"]:
-                    output += f" ({file_info['size']} 字节)"
-                if file_info["permissions"]:
-                    output += f" [{file_info['permissions']}]"
-                output += "\n"
+    def _authenticate(self, scope, client_ip: str) -> Optional[str]:
+        if not self.auth_manager.config.enable_auth:
+            return "anonymous"
 
-            return CallToolResult(content=[TextContent(type="text", text=output)])
-        else:
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text",
-                        text=f"获取目录列表失败: {result.get('error', '未知错误')}"
-                    )
-                ],
-                isError=True,
-            )
+        if not self.auth_manager.is_ip_allowed(client_ip):
+            return None
+        if not self.auth_manager.check_rate_limit(client_ip):
+            return None
 
-    async def _handle_session_create(self, args: Dict[str, Any]) -> CallToolResult:
-        """处理创建会话"""
-        name = args["name"]
-        connection = args["connection"]
+        authorization = _get_header(scope, "authorization") or ""
+        api_key = _get_header(scope, "x-api-key") or ""
+        if authorization.startswith("Bearer "):
+            token = authorization[7:]
+            return self.auth_manager.verify_token(token)
+        if api_key:
+            client_id = _get_header(scope, "x-client-id") or ""
+            if client_id and self.auth_manager.generate_token(client_id, api_key):
+                return client_id
+        return None
 
-        ssh_conn = self.ssh_manager.get_connection(connection)
-        if not ssh_conn:
-            return CallToolResult(
-                content=[
-                    TextContent(type="text", text=f"SSH 连接不存在: {connection}")
-                ],
-                isError=True,
-            )
+# --- 配置加载 ---
 
-        session_id = self.session_manager.create_session(name, connection)
+def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
+    default_config = {
+        "server": {
+            "host": os.getenv("MCP_SSH_HOST", "0.0.0.0"),
+            "port": int(os.getenv("MCP_SSH_PORT", "8080")),
+            "log_level": os.getenv("MCP_SSH_LOG_LEVEL", "INFO"),
+        },
+        "security": {
+            "enable_auth": False,
+            "jwt_secret": "",
+            "jwt_algorithm": "HS256",
+            "jwt_expiration": 3600,
+            "api_keys": {},
+            "allowed_ips": [],
+            "rate_limit": 100,
+            "enable_cors": True,
+            "cors_origins": ["*"],
+        },
+        "ssh": {
+            "default_timeout": 30,
+            "max_connections": 50,
+            "keepalive_interval": 60,
+            "connection_cleanup_hours": 24,
+        },
+        "sessions": {
+            "max_sessions": 100,
+            "session_cleanup_hours": 24,
+            "default_working_directory": "/home",
+        },
+    }
 
-        return CallToolResult(
-            content=[
-                TextContent(
-                    type="text", text=f"会话创建成功: {name} (ID: {session_id})"
-                )
-            ]
-        )
+    if config_path and os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                import json
+                file_config = json.load(f)
+            
+            # 简单的深度合并
+            def deep_update(base_dict, update_dict):
+                for key, value in update_dict.items():
+                    if key in base_dict and isinstance(base_dict[key], dict) and isinstance(value, dict):
+                        deep_update(base_dict[key], value)
+                    else:
+                        base_dict[key] = value
+            
+            deep_update(default_config, file_config)
+            logger.info(f"已加载配置文件: {config_path}")
+        except Exception as e:
+            logger.error(f"加载配置文件失败: {e}")
 
-    async def _handle_session_list(self, args: Dict[str, Any]) -> CallToolResult:
-        """处理列出会话"""
-        sessions = self.session_manager.list_sessions()
+    return default_config
 
-        if not sessions:
-            return CallToolResult(
-                content=[TextContent(type="text", text="没有活跃的会话")]
-            )
+# --- 全局状态 ---
 
-        result = "会话列表:\n"
-        for session in sessions:
-            result += f"- {session['name']} (ID: {session['id']})\n"
-            result += f"  连接: {session['connection_name']}\n"
-            result += f"  消息数: {session['message_count']}\n"
-            result += f"  工作目录: {session['working_directory']}\n"
+config_path = os.getenv("MCP_SSH_CONFIG")
+config = load_config(config_path)
 
-        return CallToolResult(content=[TextContent(type="text", text=result)])
+ssh_manager = SSHConnectionManager()
+session_manager = SessionManager()
 
-    async def _handle_session_delete(self, args: Dict[str, Any]) -> CallToolResult:
-        """处理删除会话"""
-        session_id = args["session_id"]
-        success = self.session_manager.delete_session(session_id)
+# Auth Config
+security_cfg = config["security"]
+jwt_secret = security_cfg.get("jwt_secret") or os.getenv("MCP_SSH_JWT_SECRET", "")
+if not jwt_secret:
+    jwt_secret = secrets.token_urlsafe(32)
 
-        if success:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"会话已删除: {session_id}")]
-            )
-        else:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"会话不存在: {session_id}")],
-                isError=True,
-            )
+auth_config = AuthConfig(
+        enable_auth=bool(security_cfg.get("enable_auth", False)),
+        jwt_secret=jwt_secret,
+    jwt_algorithm=security_cfg.get("jwt_algorithm", "HS256"),
+    jwt_expiration=int(security_cfg.get("jwt_expiration", 3600)),
+    api_keys=dict(security_cfg.get("api_keys", {})),
+    allowed_ips=list(security_cfg.get("allowed_ips", [])),
+    rate_limit=int(security_cfg.get("rate_limit", 100)),
+    enable_cors=bool(security_cfg.get("enable_cors", True)),
+    cors_origins=list(security_cfg.get("cors_origins", ["*"])),
+)
+auth_manager = AuthManager(auth_config)
 
-    async def _handle_session_execute(self, args: Dict[str, Any]) -> CallToolResult:
-        """处理会话中执行命令"""
-        session_id = args["session_id"]
-        command = args["command"]
-        timeout = args.get("timeout", 30)
+# --- MCP 服务器初始化 ---
 
-        session = self.session_manager.get_session(session_id)
-        if not session:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"会话不存在: {session_id}")],
-                isError=True,
-            )
+mcp = FastMCP(
+    name="mcp-ssh-server",
+    log_level=str(config["server"].get("log_level", "INFO")).upper(),
+    # 我们将手动运行服务器，所以这里只作为容器
+)
 
-        self.session_manager.add_user_message(session_id, command)
+# --- 工具定义 ---
 
-        result = self.ssh_manager.execute_command(
-            session.connection_name, command, timeout
-        )
+@mcp.tool()
+def ssh_connect(
+    name: str,
+    host: str,
+    username: str,
+    port: int = 22,
+    password: str | None = None,
+    key_filename: str | None = None,
+    timeout: int = 30,
+) -> str:
+    """建立 SSH 连接"""
+    ssh_cfg = SSHConfig(
+        host=host,
+        username=username,
+        port=port,
+        password=password,
+        key_filename=key_filename,
+        timeout=timeout,
+    )
+    if not ssh_manager.add_connection(name, ssh_cfg):
+        raise ToolError(f"SSH 连接失败: {name}")
+    return f"SSH 连接建立成功: {name}"
 
-        if result["success"]:
-            response = f"命令执行成功:\n{result['stdout']}"
-            if result["stderr"]:
-                response += f"\n标准错误:\n{result['stderr']}"
-        else:
-            response = f"命令执行失败: {result.get('error', '未知错误')}"
+@mcp.tool()
+def ssh_disconnect(name: str) -> str:
+    """断开 SSH 连接"""
+    ssh_manager.remove_connection(name)
+    return f"SSH 连接已断开: {name}"
 
-        self.session_manager.add_assistant_message(
-            session_id, response, command, result
-        )
+@mcp.tool()
+def ssh_list_connections() -> str:
+    """列出所有 SSH 连接"""
+    connections = ssh_manager.list_connections()
+    if not connections:
+        return "没有活跃的 SSH 连接"
+    result = "SSH 连接列表:\n"
+    for name, info in connections.items():
+        status = "已连接" if info["is_connected"] else "未连接"
+        result += f"- {name}: {info['username']}@{info['host']} ({status})\n"
+    return result
 
-        return CallToolResult(
-            content=[TextContent(type="text", text=response)],
-            isError=not result["success"],
-        )
+@mcp.tool()
+def ssh_execute(connection: str, command: str, timeout: int = 30) -> str:
+    """在远程服务器上执行命令"""
+    result = ssh_manager.execute_command(connection, command, timeout)
+    if result["success"]:
+        output = f"命令执行成功:\n{result['stdout']}"
+        if result["stderr"]:
+            output += f"\n标准错误:\n{result['stderr']}"
+        return output
+    raise ToolError(f"命令执行失败: {result.get('error', '未知错误')}")
 
-    async def _handle_session_history(self, args: Dict[str, Any]) -> CallToolResult:
-        """处理获取会话历史"""
-        session_id = args["session_id"]
-        count = args.get("count", 20)
+@mcp.tool()
+def ssh_upload(connection: str, local_path: str, remote_path: str) -> str:
+    """上传文件到远程服务器"""
+    result = ssh_manager.upload_file(connection, local_path, remote_path)
+    if result["success"]:
+        return f"文件上传成功: {local_path} -> {remote_path}"
+    raise ToolError(f"文件上传失败: {result.get('error', '未知错误')}")
 
-        history = self.session_manager.get_session_history(session_id, count)
+@mcp.tool()
+def ssh_download(connection: str, remote_path: str, local_path: str) -> str:
+    """从远程服务器下载文件"""
+    result = ssh_manager.download_file(connection, remote_path, local_path)
+    if result["success"]:
+        return f"文件下载成功: {remote_path} -> {local_path}"
+    raise ToolError(f"文件下载失败: {result.get('error', '未知错误')}")
 
-        if not history:
-            return CallToolResult(
-                content=[
-                    TextContent(
-                        type="text", text=f"会话不存在或无历史记录: {session_id}"
-                    )
-                ]
-            )
+@mcp.tool()
+def ssh_list(connection: str, path: str = ".") -> str:
+    """列出远程目录内容"""
+    result = ssh_manager.list_directory(connection, path)
+    if not result["success"]:
+        raise ToolError(f"获取目录列表失败: {result.get('error', '未知错误')}")
+    files = result["files"]
+    if not files:
+        return f"目录为空: {path}"
+    output = f"目录内容: {path}\n"
+    for file_info in files:
+        file_type = "目录" if file_info["type"] == "directory" else "文件"
+        output += f"{file_type}: {file_info['name']}"
+        if file_info["size"]:
+            output += f" ({file_info['size']} 字节)"
+        if file_info["permissions"]:
+            output += f" [{file_info['permissions']}]"
+        output += "\n"
+    return output
 
-        result = f"会话历史 (最近 {len(history)} 条消息):\n"
-        for msg in history:
-            timestamp = msg["timestamp"]
-            role = msg["role"]
-            content = msg["content"]
-            result += f"[{role}] {timestamp}: {content}\n"
-            if msg["command"]:
-                result += f"执行命令: {msg['command']}\n"
+@mcp.tool()
+def session_create(name: str, connection: str) -> str:
+    """创建新的交互会话"""
+    if not ssh_manager.get_connection(connection):
+        raise ToolError(f"SSH 连接不存在: {connection}")
+    session_id = session_manager.create_session(name, connection)
+    return f"会话创建成功: {name} (ID: {session_id})"
 
-        return CallToolResult(content=[TextContent(type="text", text=result)])
+@mcp.tool()
+def session_list() -> str:
+    """列出所有会话"""
+    sessions = session_manager.list_sessions()
+    if not sessions:
+        return "没有活跃的会话"
+    result = "会话列表:\n"
+    for session in sessions:
+        result += f"- {session['name']} (ID: {session['id']})\n"
+        result += f"  连接: {session['connection_name']}\n"
+        result += f"  消息数: {session['message_count']}\n"
+        result += f"  工作目录: {session['working_directory']}\n"
+    return result
 
-    async def _handle_session_context(self, args: Dict[str, Any]) -> CallToolResult:
-        """处理获取会话上下文"""
-        session_id = args["session_id"]
+@mcp.tool()
+def session_delete(session_id: str) -> str:
+    """删除会话"""
+    if not session_manager.delete_session(session_id):
+        raise ToolError(f"会话不存在: {session_id}")
+    return f"会话已删除: {session_id}"
 
-        context = self.session_manager.get_session_context(session_id)
+@mcp.tool()
+def session_execute(session_id: str, command: str, timeout: int = 30) -> str:
+    """在会话中执行命令"""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise ToolError(f"会话不存在: {session_id}")
+    session_manager.add_user_message(session_id, command)
+    result = ssh_manager.execute_command(session.connection_name, command, timeout)
+    if result["success"]:
+        response = f"命令执行成功:\n{result['stdout']}"
+        if result["stderr"]:
+            response += f"\n标准错误:\n{result['stderr']}"
+    else:
+        response = f"命令执行失败: {result.get('error', '未知错误')}"
+    session_manager.add_assistant_message(session_id, response, command, result)
+    if not result["success"]:
+        raise ToolError(response)
+    return response
 
-        if not context:
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"会话不存在: {session_id}")],
-                isError=True,
-            )
+@mcp.tool()
+def session_history(session_id: str, count: int = 20) -> str:
+    """获取会话历史记录"""
+    history = session_manager.get_session_history(session_id, count)
+    if not history:
+        return f"会话不存在或无历史记录: {session_id}"
+    result = f"会话历史 (最近 {len(history)} 条消息):\n"
+    for msg in history:
+        result += f"[{msg['role']}] {msg['timestamp']}: {msg['content']}\n"
+        if msg['command']:
+            result += f"执行命令: {msg['command']}\n"
+    return result
 
-        result = f"会话上下文:\n"
-        result += f"会话 ID: {context['session_id']}\n"
-        result += f"会话名称: {context['name']}\n"
-        result += f"SSH 连接: {context['connection_name']}\n"
-        result += f"工作目录: {context['working_directory']}\n"
-        result += f"消息数量: {context['message_count']}\n"
-        result += f"最后活动: {context['last_activity']}\n"
+@mcp.tool()
+def session_context(session_id: str) -> str:
+    """获取会话上下文信息"""
+    context = session_manager.get_session_context(session_id)
+    if not context:
+        raise ToolError(f"会话不存在: {session_id}")
+    result = "会话上下文:\n"
+    result += f"会话 ID: {context['session_id']}\n"
+    result += f"会话名称: {context['name']}\n"
+    result += f"SSH 连接: {context['connection_name']}\n"
+    result += f"工作目录: {context['working_directory']}\n"
+    result += f"消息数量: {context['message_count']}\n"
+    result += f"最后活动: {context['last_activity']}\n"
+    if context["environment"]:
+        result += "环境变量:\n"
+        for key, value in context["environment"].items():
+            result += f"  {key}={value}\n"
+    return result
 
-        if context["environment"]:
-            result += "环境变量:\n"
-            for key, value in context["environment"].items():
-                result += f"  {key}={value}\n"
+@mcp.tool()
+def ssh_shell(connection: str, term: str = "xterm") -> str:
+    """创建交互式 shell"""
+    result = ssh_manager.create_shell(connection, term)
+    if not result["success"]:
+        raise ToolError(f"创建交互式 shell 失败: {result.get('error', '未知错误')}")
+    shell = result["shell"]
+    sessions = session_manager.list_sessions()
+    for session in sessions:
+        if session["connection_name"] == connection:
+            session_manager.create_shell(session["id"], shell)
+    return f"交互式 shell 创建成功: {connection} (终端类型: {term})"
 
-        return CallToolResult(content=[TextContent(type="text", text=result)])
+@mcp.tool()
+def shell_send(session_id: str, command: str) -> str:
+    """在交互式 shell 中发送命令"""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise ToolError(f"会话不存在: {session_id}")
+    if not session_manager.is_shell_active(session_id):
+        raise ToolError(f"会话 {session_id} 没有活跃的 shell")
+    shell = session_manager.get_shell(session_id)
+    if not shell:
+        raise ToolError(f"无法获取会话 {session_id} 的 shell")
+    result = ssh_manager.send_shell_command(session.connection_name, shell, command)
+    if result["success"]:
+        session_manager.add_user_message(session_id, command)
+        response = f"Shell 命令执行成功:\n{result['output']}"
+        session_manager.add_assistant_message(session_id, response, command, result)
+        return response
+    error_msg = f"Shell 命令执行失败: {result.get('error', '未知错误')}"
+    session_manager.add_assistant_message(session_id, error_msg, command, result)
+    raise ToolError(error_msg)
 
-    async def start(self):
-        """启动服务器"""
-        runner = web.AppRunner(self.app)
-        await runner.setup()
-        site = web.TCPSite(runner, self.host, self.port)
-        await site.start()
-        
-        logger.info(f"远程 MCP SSH 服务器启动在 {self.host}:{self.port}")
-        return runner
+@mcp.tool()
+def shell_close(session_id: str) -> str:
+    """关闭交互式 shell"""
+    session = session_manager.get_session(session_id)
+    if not session:
+        raise ToolError(f"会话不存在: {session_id}")
+    if not session_manager.is_shell_active(session_id):
+        raise ToolError(f"会话 {session_id} 没有活跃的 shell")
+    shell = session_manager.get_shell(session_id)
+    if not shell:
+        raise ToolError(f"无法获取会话 {session_id} 的 shell")
+    result = ssh_manager.close_shell(session.connection_name, shell)
+    if not result["success"]:
+        raise ToolError(f"关闭 shell 失败: {result.get('error', '未知错误')}")
+    session_manager.close_shell(session_id)
+    return f"交互式 shell 已关闭: {session_id}"
 
-    async def stop(self):
-        """停止服务器"""
-        self.ssh_manager.shutdown()
-        logger.info("远程 MCP SSH 服务器已停止")
+# --- 路由定义 ---
 
-    async def root_handler(self, request):
-        """根路径处理器 - 返回服务器信息"""
-        return web.json_response({
+@mcp.custom_route("/", methods=["GET"])
+async def root_handler(_: Request) -> Response:
+    return JSONResponse(
+        {
             "server": "mcp-ssh-server",
             "version": "0.1.0",
-            "message": "欢迎使用 MCP SSH 服务器，请使用 /mcp 路径进行 MCP 通信，或使用 /ws 进行 WebSocket 通信",
+            "message": "欢迎使用 MCP SSH 服务器，请使用 /mcp 进行 MCP 通信，或使用 /ws 进行 WebSocket 通信",
             "endpoints": {
                 "mcp": "/mcp",
                 "websocket": "/ws",
-                "health": "/health", 
-                "status": "/status"
-            }
-        })
+                "health": "/health",
+                "status": "/status",
+            },
+        }
+    )
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health_handler(_: Request) -> Response:
+    return JSONResponse({"status": "healthy", "timestamp": time.time()})
 
+@mcp.custom_route("/status", methods=["GET"])
+async def status_handler(_: Request) -> Response:
+    return JSONResponse(
+        {
+            "server": "mcp-ssh-server",
+            "version": "0.1.0",
+            "ssh_connections": len(ssh_manager.list_connections()),
+            "sessions": len(session_manager.list_sessions()),
+        }
+    )
 
+# --- 应用构建 ---
 
+def create_app():
+    # 获取 FastMCP 生成的 Starlette 应用 (只包含 /mcp SSE 端点)
+    # 注意：FastMCP 的 streamable_http_app 默认会挂载在 /sse 或 /message，
+    # 但我们初始化时没指定，所以需要确认 FastMCP 行为。
+    # 上面的代码中我们没有指定 streamable_http_path，默认是 /sse。
+    # 原代码用 /mcp。
+    
+    # 重新初始化 mcp 以匹配原代码的路径配置（如果需要）
+    # 但 FastMCP 实例已经创建。
+    
+    # 访问底层 app
+    mcp_app = mcp.streamable_http_app()
+    
+    # 添加 WebSocket 路由
+    async def ws_endpoint(scope, receive, send):
+        async with websocket_server(scope, receive, send) as (read_stream, write_stream):
+            await mcp._mcp_server.run(
+                read_stream,
+                write_stream,
+                mcp._mcp_server.create_initialization_options(),
+            )
+            
+    # 插入 WebSocket 路由到最前面
+    mcp_app.router.routes.insert(0, WebSocketRoute("/ws", endpoint=ws_endpoint))
+    
+    # 应用中间件
+    return ApiKeyAuthMiddleware(
+        mcp_app,
+        auth_manager=auth_manager,
+        enable_cors=auth_config.enable_cors,
+        cors_origins=auth_config.cors_origins,
+        public_paths={"/health", "/status", "/"},
+    )
 
+def main():
+    host = config["server"]["host"]
+    port = config["server"]["port"]
+    logger.info(f"远程 MCP SSH 服务器启动在 {host}:{port}")
+    
+    app = create_app()
+    uvicorn.run(app, host=host, port=port, log_level=str(config["server"].get("log_level", "INFO")).lower())
 
-
-
-
-
-
-
-
-
-
-
+if __name__ == "__main__":
+    main()

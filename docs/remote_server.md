@@ -1,4 +1,4 @@
-# 远程 MCP SSH 服务器
+ # 远程 MCP SSH 服务器
 
 远程 MCP SSH 服务器允许您通过网络访问 MCP SSH 服务，支持多客户端连接和远程管理。
 
@@ -203,7 +203,8 @@ async def websocket_client():
     
     async with websockets.connect(
         "ws://localhost:8080/ws",
-        extra_headers=headers
+        extra_headers=headers,
+        subprotocols=["mcp"],
     ) as websocket:
         # 初始化
         init_request = {

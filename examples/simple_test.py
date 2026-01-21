@@ -39,7 +39,9 @@ async def test_connection():
         print("\n测试认证...")
         headers = {
             "X-API-Key": api_key,
-            "X-Client-ID": client_id
+            "X-Client-ID": client_id,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
         }
         
         # 发送初始化请求
@@ -57,7 +59,7 @@ async def test_connection():
         async with session.post(
             f"{base_url}/mcp",
             headers=headers,
-            data=json.dumps(init_request)
+            data=json.dumps(init_request),
         ) as response:
             if response.status == 200:
                 data = await response.json()
@@ -78,7 +80,7 @@ async def test_connection():
         async with session.post(
             f"{base_url}/mcp",
             headers=headers,
-            data=json.dumps(tools_request)
+            data=json.dumps(tools_request),
         ) as response:
             if response.status == 200:
                 data = await response.json()

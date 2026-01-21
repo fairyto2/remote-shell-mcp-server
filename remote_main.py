@@ -1,10 +1,5 @@
-"""
-远程 MCP SSH 服务器入口点
+"""远程 MCP SSH 服务器入口点"""
 
-启动基于 HTTP/WebSocket 的远程 MCP SSH 服务器。
-"""
-
-import asyncio
 import logging
 import sys
 import os
@@ -21,8 +16,7 @@ def setup_logging():
     )
 
 
-async def main():
-    """主函数"""
+def main():
     setup_logging()
     logger = logging.getLogger(__name__)
     
@@ -38,31 +32,23 @@ async def main():
         if os.path.exists(default_config):
             config_path = default_config
     
-    logger.info(f"启动远程 MCP SSH 服务器")
+    logger.info("启动远程 MCP SSH 服务器")
     if config_path:
         logger.info(f"使用配置文件: {config_path}")
     
     try:
         server = RemoteMCPSshServer(config_path=config_path)
         logger.info(f"服务器监听在 {server.host}:{server.port}")
-        
-        # 启动服务器
-        runner = await server.start()
-        
-        # 保持运行
         try:
-            while True:
-                await asyncio.sleep(1)
+            server.run()
         except KeyboardInterrupt:
             logger.info("服务器被用户中断")
         finally:
-            await server.stop()
-            await runner.cleanup()
-            
+            server.shutdown()
     except Exception as e:
         logger.error(f"服务器运行出错: {e}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
