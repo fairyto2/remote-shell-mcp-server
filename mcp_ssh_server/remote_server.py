@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import os
-import secrets
 import time
 import json
 from typing import Any, Dict, Optional
@@ -16,163 +15,17 @@ import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.websocket import websocket_server
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import WebSocketRoute
 
-from .security import AuthConfig, AuthManager
 from .session_manager import SessionManager
 from .ssh_manager import SSHConfig, SSHConnectionManager
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-# --- 辅助函数 ---
-
-def _get_client_ip(scope) -> str:
-    client = scope.get("client")
-    if isinstance(client, (list, tuple)) and client:
-        return str(client[0])
-    return "0.0.0.0"
-
-def _get_header(scope, name: str) -> Optional[str]:
-    raw = scope.get("headers") or []
-    key = name.lower().encode()
-    for k, v in raw:
-        if k.lower() == key:
-            try:
-                return v.decode()
-            except Exception:
-                return None
-    return None
-
-def _cors_headers(cors_origins: list[str], origin: str) -> list[tuple[bytes, bytes]]:
-    allow_origin = "*"
-    if "*" not in cors_origins:
-        if origin in cors_origins:
-            allow_origin = origin
-        else:
-            allow_origin = cors_origins[0] if cors_origins else "*"
-
-    return [
-        (b"access-control-allow-origin", allow_origin.encode()),
-        (b"access-control-allow-methods", b"GET, POST, PUT, DELETE, OPTIONS"),
-        (
-            b"access-control-allow-headers",
-            b"Content-Type, Authorization, X-API-Key, X-Client-ID",
-        ),
-        (b"access-control-max-age", b"86400"),
-    ]
-
-# --- 中间件 ---
-
-class ApiKeyAuthMiddleware:
-    def __init__(
-        self,
-        app,
-        *,
-        auth_manager: AuthManager,
-        enable_cors: bool,
-        cors_origins: list[str],
-        public_paths: set[str],
-    ):
-        self.app = app
-        self.auth_manager = auth_manager
-        self.enable_cors = enable_cors
-        self.cors_origins = cors_origins
-        self.public_paths = public_paths
-
-    async def __call__(self, scope, receive, send):
-        scope_type = scope.get("type")
-        if scope_type == "http":
-            path = scope.get("path", "")
-            method = scope.get("method", "")
-            if self.enable_cors and method == "OPTIONS":
-                origin = _get_header(scope, "origin") or "*"
-                headers = _cors_headers(self.cors_origins, origin)
-                await send(
-                    {
-                        "type": "http.response.start",
-                        "status": 204,
-                        "headers": headers,
-                    }
-                )
-                await send({"type": "http.response.body", "body": b""})
-                return
-
-            if path not in self.public_paths:
-                client_ip = _get_client_ip(scope)
-                client_id = self._authenticate(scope, client_ip)
-                if not client_id:
-                    origin = _get_header(scope, "origin") or "*"
-                    headers = [(b"content-type", b"application/json")] + _cors_headers(
-                        self.cors_origins, origin
-                    )
-                    await send(
-                        {
-                            "type": "http.response.start",
-                            "status": 401,
-                            "headers": headers,
-                        }
-                    )
-                    await send(
-                        {
-                            "type": "http.response.body",
-                            "body": b'{"error":"\xe8\xae\xa4\xe8\af\x81\xe5\xa4\xb1\xe8\xb4\xa5"}',
-                        }
-                    )
-                    return
-                scope.setdefault("state", {})["client_id"] = client_id
-
-            if not self.enable_cors:
-                await self.app(scope, receive, send)
-                return
-
-            origin = _get_header(scope, "origin") or "*"
-            cors_headers = _cors_headers(self.cors_origins, origin)
-
-            async def send_with_cors(message):
-                if message.get("type") == "http.response.start":
-                    raw_headers = list(message.get("headers", []))
-                    raw_headers.extend(cors_headers)
-                    message["headers"] = raw_headers
-                await send(message)
-
-            await self.app(scope, receive, send_with_cors)
-            return
-
-        if scope_type == "websocket":
-            path = scope.get("path", "")
-            if path not in self.public_paths:
-                client_ip = _get_client_ip(scope)
-                client_id = self._authenticate(scope, client_ip)
-                if not client_id:
-                    await send({"type": "websocket.close", "code": 1008})
-                    return
-                scope.setdefault("state", {})["client_id"] = client_id
-
-        await self.app(scope, receive, send)
-
-    def _authenticate(self, scope, client_ip: str) -> Optional[str]:
-        if not self.auth_manager.config.enable_auth:
-            return "anonymous"
-
-        if not self.auth_manager.is_ip_allowed(client_ip):
-            return None
-        if not self.auth_manager.check_rate_limit(client_ip):
-            return None
-
-        authorization = _get_header(scope, "authorization") or ""
-        api_key = _get_header(scope, "x-api-key") or ""
-        if authorization.startswith("Bearer "):
-            token = authorization[7:]
-            return self.auth_manager.verify_token(token)
-        if api_key:
-            client_id = _get_header(scope, "x-client-id") or ""
-            if client_id and self.auth_manager.generate_token(client_id, api_key):
-                return client_id
-        return None
 
 # --- 配置加载 ---
 
@@ -182,17 +35,6 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
             "host": os.getenv("MCP_SSH_HOST", "0.0.0.0"),
             "port": int(os.getenv("MCP_SSH_PORT", "8080")),
             "log_level": os.getenv("MCP_SSH_LOG_LEVEL", "INFO"),
-        },
-        "security": {
-            "enable_auth": False,
-            "jwt_secret": "",
-            "jwt_algorithm": "HS256",
-            "jwt_expiration": 3600,
-            "api_keys": {},
-            "allowed_ips": [],
-            "rate_limit": 100,
-            "enable_cors": True,
-            "cors_origins": ["*"],
         },
         "ssh": {
             "default_timeout": 30,
@@ -236,31 +78,19 @@ config = load_config(config_path)
 ssh_manager = SSHConnectionManager()
 session_manager = SessionManager()
 
-# Auth Config
-security_cfg = config["security"]
-jwt_secret = security_cfg.get("jwt_secret") or os.getenv("MCP_SSH_JWT_SECRET", "")
-if not jwt_secret:
-    jwt_secret = secrets.token_urlsafe(32)
-
-auth_config = AuthConfig(
-        enable_auth=bool(security_cfg.get("enable_auth", False)),
-        jwt_secret=jwt_secret,
-    jwt_algorithm=security_cfg.get("jwt_algorithm", "HS256"),
-    jwt_expiration=int(security_cfg.get("jwt_expiration", 3600)),
-    api_keys=dict(security_cfg.get("api_keys", {})),
-    allowed_ips=list(security_cfg.get("allowed_ips", [])),
-    rate_limit=int(security_cfg.get("rate_limit", 100)),
-    enable_cors=bool(security_cfg.get("enable_cors", True)),
-    cors_origins=list(security_cfg.get("cors_origins", ["*"])),
-)
-auth_manager = AuthManager(auth_config)
-
 # --- MCP 服务器初始化 ---
+
+# 配置传输安全设置，允许所有 Host 和 Origin
+# 这是解决 421 Misdirected Request 的关键
+transport_security_settings = TransportSecuritySettings(
+    enable_dns_rebinding_protection=False
+)
 
 mcp = FastMCP(
     name="mcp-ssh-server",
     log_level=str(config["server"].get("log_level", "INFO")).upper(),
-    # 我们将手动运行服务器，所以这里只作为容器
+    transport_security=transport_security_settings,
+    sse_path="/mcp",  # 使用 sse_path 参数而不是 streamable_http_path
 )
 
 # --- 工具定义 ---
@@ -517,49 +347,21 @@ async def status_handler(_: Request) -> Response:
         }
     )
 
-# --- 应用构建 ---
-
-def create_app():
-    # 获取 FastMCP 生成的 Starlette 应用 (只包含 /mcp SSE 端点)
-    # 注意：FastMCP 的 streamable_http_app 默认会挂载在 /sse 或 /message，
-    # 但我们初始化时没指定，所以需要确认 FastMCP 行为。
-    # 上面的代码中我们没有指定 streamable_http_path，默认是 /sse。
-    # 原代码用 /mcp。
-    
-    # 重新初始化 mcp 以匹配原代码的路径配置（如果需要）
-    # 但 FastMCP 实例已经创建。
-    
-    # 访问底层 app
-    mcp_app = mcp.streamable_http_app()
-    
-    # 添加 WebSocket 路由
-    async def ws_endpoint(scope, receive, send):
-        async with websocket_server(scope, receive, send) as (read_stream, write_stream):
-            await mcp._mcp_server.run(
-                read_stream,
-                write_stream,
-                mcp._mcp_server.create_initialization_options(),
-            )
-            
-    # 插入 WebSocket 路由到最前面
-    mcp_app.router.routes.insert(0, WebSocketRoute("/ws", endpoint=ws_endpoint))
-    
-    # 应用中间件
-    return ApiKeyAuthMiddleware(
-        mcp_app,
-        auth_manager=auth_manager,
-        enable_cors=auth_config.enable_cors,
-        cors_origins=auth_config.cors_origins,
-        public_paths={"/health", "/status", "/"},
-    )
-
 def main():
     host = config["server"]["host"]
     port = config["server"]["port"]
     logger.info(f"远程 MCP SSH 服务器启动在 {host}:{port}")
+
+    # 重新初始化 mcp 以匹配原代码的路径配置（如果需要）
+    # 但 FastMCP 实例已经创建。
     
-    app = create_app()
-    uvicorn.run(app, host=host, port=port, log_level=str(config["server"].get("log_level", "INFO")).lower())
+    # 获取 ASGI 应用
+    # 使用 sse_app() 来支持 SSE 传输，因为它与 sse_path 配置匹配
+    mcp_app = mcp.sse_app()
+    
+
+    # 启动服务器
+    uvicorn.run(mcp_app, host=host, port=port, log_level="debug")
 
 if __name__ == "__main__":
     main()
