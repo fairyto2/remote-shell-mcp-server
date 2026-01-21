@@ -47,10 +47,26 @@ uv run mcp_ssh_server
 #### 2. 远程 MCP 服务器
 
 ```bash
-uv run python remote_main.py
+uv run python -m mcp_ssh_server.remote_server
 ```
 
-适用于通过网络提供 MCP 服务，支持多客户端连接。
+适用于通过网络提供 MCP 服务，支持多客户端连接。默认端口为 `8080`。
+
+**远程连接配置：**
+
+在客户端（如 Claude Desktop）的配置文件中添加：
+
+```json
+{
+  "mcpServers": {
+    "remote-ssh": {
+      "url": "http://<服务器IP>:8080/mcp"
+    }
+  }
+}
+```
+
+**注意**：服务器已配置为允许所有 Host 和 Origin，因此可以安全地部署在远程服务器上并通过 IP 地址访问，不会出现 `421 Misdirected Request` 错误。
 
 详细配置请参考 [远程服务器文档](docs/remote_server.md)。
 
